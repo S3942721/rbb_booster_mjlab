@@ -18,6 +18,7 @@ dependencies = [
 list_envs = "mjlab.scripts.list_envs:main"
 train = "booster_mjlab.scripts.train:main"
 play = "booster_mjlab.scripts.play:main"
+collect-walk-states = "booster_mjlab.scripts.collect_walk_states:main"
 visualize-motions = "booster_mjlab.scripts.visualize_motions:main"
 upload-motion = "booster_mjlab.scripts.upload_motion:main"
 motions-to-hf = "booster_mjlab.scripts.motions_to_hf:main"
