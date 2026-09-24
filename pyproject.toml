@@ -33,5 +33,10 @@ booster_mjlab = "booster_mjlab.tasks"
 [tool.uv.sources]
 mjlab = { git = "https://github.com/mujocolab/mjlab", rev = "b517e0c489139e7fcee95702cfb2b01931264985" }
 
+[tool.uv.workspace]
+members = [
+    "booster_mjlab",
+]
+
 [dependency-groups]
 dev = ["ruff>=0.14.4"]
