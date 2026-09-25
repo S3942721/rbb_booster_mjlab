@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 
-import math
-
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
-from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
-from mjlab.tasks.velocity import mdp as velocity_mdp
 
-from booster_mjlab.environment.ball.ball_constants import (
-    BALL_SIZE_SCALES,
-    get_ball_cfg,
-)
+from booster_mjlab.environment.ball.ball_constants import get_ball_cfg
 from booster_mjlab.robots import K1_ACTION_SCALE, get_k1_robot_cfg
 from booster_mjlab.tasks.kick.kick_env_cfg import make_kick_env_cfg
 
@@ -97,7 +89,23 @@ def booster_k1_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = K1_ACTION_SCALE
+    # Head control belongs to the perception/head controller at deployment. Keep
+    # it out of this policy so the kick cannot learn to thrash it. Arms remain
+    # available for balance and are posture-regularised by the base config.
+    joint_pos_action.actuator_names = (
+        r".*_Knee_Pitch",
+        r".*_Hip_Yaw",
+        r".*_Ankle_.*",
+        r".*_Hip_Pitch",
+        r".*_Hip_Roll",
+        r".*_Shoulder_.*",
+        r".*_Elbow_.*",
+    )
+    joint_pos_action.scale = {
+        pattern: scale
+        for pattern, scale in K1_ACTION_SCALE.items()
+        if pattern != r"Head_.*"
+    }
 
     cfg.viewer.body_name = "Trunk"
 
@@ -106,39 +114,18 @@ def booster_k1_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "right_foot_collision",
     )
 
-    # Ball size/mass DR: built at size 5 (radius 0.11), scaled down toward size 1
-    # (per user decision: randomize the full FIFA range from the start).
-    size_1_scale = BALL_SIZE_SCALES[1]["size"] / BALL_SIZE_SCALES[5]["size"]
-    weight_1_scale = BALL_SIZE_SCALES[1]["weight"] / BALL_SIZE_SCALES[5]["weight"]
-    cfg.events["ball_size"] = EventTermCfg(
-        func=velocity_mdp.dr.geom_size,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("ball", geom_names=("ball_collision",)),
-            "operation": "scale",
-            "ranges": {0: (size_1_scale, 1.0)},
-        },
-    )
-    # dr.pseudo_inertia (not dr.body_mass) so mass and inertia scale together
-    # consistently, per its own docstring's recommendation for uniform density
-    # changes. alpha is a log-scale: mass/inertia scale by e^(2*alpha).
-    weight_1_alpha = 0.5 * math.log(weight_1_scale)
-    cfg.events["ball_mass"] = EventTermCfg(
-        func=velocity_mdp.dr.pseudo_inertia,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("ball", body_names=("ball",)),
-            "alpha_range": (weight_1_alpha, 0.0),
-        },
-    )
+    # Keep the first curriculum stages on the coherent size-5 model compiled by
+    # get_ball_cfg. Radius-only geom scaling and independent pseudo-inertia
+    # scaling violate the sphere inertia relation and leave friction/visuals
+    # inconsistent. Reintroduce size variation only through a coupled randomizer.
 
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("Trunk",)
+    cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("Trunk",)
 
-    # Apply play mode overrides.
+    # Play is also the strict visual evaluation config: preserve normal horizon
+    # and failures, while bypassing the custom stateful vision corruption.
     if play:
-        cfg.episode_length_s = int(1e9)
         cfg.observations["actor"].enable_corruption = False
-        cfg.terminations.pop("illegal_contact", None)
-        cfg.terminations.pop("mis_kick", None)
+        cfg.observations["actor"].terms["ball_state"].params["enable_noise"] = False
 
     return cfg

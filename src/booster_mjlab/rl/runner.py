@@ -27,8 +27,33 @@ class BoosterOnPolicyRunner(VelocityOnPolicyRunner):
     env: RslRlVecEnvWrapper
 
     def save(self, path: str, infos=None) -> None:
+        from booster_mjlab.tasks.kick.mdp.curriculums import (
+            export_kick_curriculum_state,
+        )
+
+        kick_state = export_kick_curriculum_state(self.env.unwrapped)
+        if kick_state is not None:
+            infos = {**(infos or {}), "kick_curriculum_state": kick_state}
         super().save(path, infos)
         _, _, onnx_path = self._get_export_paths(path)
         if onnx_path.exists():
             attach_base_metadata(self.env.unwrapped, str(onnx_path))
             attach_exclusion_metadata(self.env.unwrapped, onnx_path)
+
+    def load(
+        self,
+        path: str,
+        load_cfg: dict | None = None,
+        strict: bool = True,
+        map_location: str | None = None,
+    ) -> dict:
+        from booster_mjlab.tasks.kick.mdp.curriculums import (
+            restore_kick_curriculum_state,
+        )
+
+        infos = super().load(path, load_cfg, strict, map_location)
+        restore_kick_curriculum_state(
+            self.env.unwrapped,
+            infos.get("kick_curriculum_state") if infos else None,
+        )
+        return infos

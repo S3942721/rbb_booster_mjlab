@@ -72,7 +72,10 @@ def get_base_metadata(
     """Build ONNX metadata, fixing PD gains for python-PD-backed actuators."""
     robot: Entity = env.scene["robot"]
     md = _mjlab_get_base_metadata(env, run_path)
-    _remove_passive_joints_from_metadata(robot, md)
+    _align_joint_metadata_with_actions(env, robot, md)
+    kick_schema = getattr(env, "_kick_command_schema", None)
+    if kick_schema is not None:
+        md["kick_command_schema"] = kick_schema
 
     if not any(isinstance(a, IdealPdActuator) for a in robot.actuators):
         return md
@@ -104,19 +107,51 @@ def get_base_metadata(
     return md
 
 
-def _remove_passive_joints_from_metadata(robot: Entity, md: dict) -> None:
-    """Align joint metadata with the entity's naturally ordered actuated joints."""
-    actuated_names = {
-        name for actuator in robot.actuators for name in actuator.target_names
-    }
-    actuated_ids = [
-        index for index, name in enumerate(robot.joint_names) if name in actuated_names
-    ]
+def _align_joint_metadata_with_actions(
+    env: ManagerBasedRlEnv, robot: Entity, md: dict
+) -> None:
+    """Align joint metadata with the exact action ordering used by the policy.
 
-    md["joint_names"] = [robot.joint_names[index] for index in actuated_ids]
+    An articulated robot can expose actuators which are deliberately not driven
+    by a policy. In particular, the kick policy leaves K1's head joints to a
+    perception controller. Export metadata must follow the action term rather
+    than every actuator, otherwise its joint fields disagree with action_scale.
+    """
+    controlled_names: list[str] = []
+    for term_name in env.action_manager.active_terms:
+        action_term = env.action_manager.get_term(term_name)
+        target_names = getattr(action_term, "target_names", ())
+        controlled_names.extend(
+            name for name in target_names if name in robot.joint_names
+        )
+
+    metadata_joint_names = list(md["joint_names"])
+    if controlled_names:
+        if len(set(controlled_names)) != len(controlled_names):
+            raise ValueError(
+                "ONNX metadata cannot represent duplicate controlled joint names"
+            )
+        joint_names = controlled_names
+    else:
+        actuated_names = {
+            name for actuator in robot.actuators for name in actuator.target_names
+        }
+        joint_names = [name for name in robot.joint_names if name in actuated_names]
+
+    try:
+        robot_joint_ids = [robot.joint_names.index(name) for name in joint_names]
+        metadata_joint_ids = [metadata_joint_names.index(name) for name in joint_names]
+    except ValueError as error:
+        raise ValueError(
+            "ONNX metadata is missing a joint controlled by the policy"
+        ) from error
+
+    md["joint_names"] = joint_names
     md["default_joint_pos"] = (
-        robot.data.default_joint_pos[0, actuated_ids].cpu().tolist()
+        robot.data.default_joint_pos[0, robot_joint_ids].cpu().tolist()
     )
+    for key in ("joint_stiffness", "joint_damping"):
+        md[key] = [md[key][index] for index in metadata_joint_ids]
 
     joint_field_lengths = {
         key: len(md[key])

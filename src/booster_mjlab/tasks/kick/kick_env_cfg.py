@@ -21,10 +21,8 @@ from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from booster_mjlab.mdp.terminations import stochastic_bad_orientation
 from booster_mjlab.tasks.kick import mdp as kick_mdp
 from booster_mjlab.tasks.kick.mdp.commands import KickCommandCfg
-from booster_mjlab.tasks.velocity.mdp.rewards import variable_upright
 
 
 def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -63,7 +61,16 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
             noise=Unoise(n_min=-1.5, n_max=1.5),
         ),
         "actions": ObservationTermCfg(func=velocity_mdp.last_action),
-        "ball_state": ObservationTermCfg(func=kick_mdp.noisy_ball_state_relative_b),
+        "ball_state": ObservationTermCfg(
+            func=kick_mdp.noisy_ball_state_relative_b,
+            params={
+                "pos_noise_std": 0.07,
+                "vel_noise_std": 0.4,
+                "latency_steps": 2,
+                "dropout_prob": 0.05,
+                "enable_noise": True,
+            },
+        ),
         "command": ObservationTermCfg(
             func=velocity_mdp.generated_commands,
             params={"command_name": "kick"},
@@ -78,7 +85,7 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
             func=velocity_mdp.builtin_sensor,
             params={"sensor_name": "robot/imu_lin_vel"},
         ),
-        "ball_state": ObservationTermCfg(func=kick_mdp.ball_state_relative_b),
+        "ball_state": ObservationTermCfg(func=kick_mdp.clean_ball_state_relative_b),
     }
 
     observations = {
@@ -115,13 +122,20 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
         "kick": KickCommandCfg(
             entity_name="robot",
             ball_entity_name="ball",
-            resampling_time_range=(1.0e9, 1.0e9),  # Effectively: resample on reset only.
+            resampling_time_range=(
+                1.0e9,
+                1.0e9,
+            ),  # Effectively: resample on reset only.
             debug_vis=True,
             ranges=KickCommandCfg.Ranges(
                 # Curriculum widens these over training; see kick_envelope below.
                 speed=(1.5, 2.5),
-                yaw=(-math.pi / 2, math.pi / 2),
+                yaw=(-math.pi, math.pi),
                 chip_angle=(0.0, 0.0),
+                speed_tolerance_fraction=(0.30, 0.50),
+                direction_tolerance=(math.radians(30.0), math.radians(60.0)),
+                elevation_tolerance=(math.radians(8.0), math.radians(15.0)),
+                urgency=(0.2, 0.8),
             ),
         )
     }
@@ -145,9 +159,9 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
             mode="reset",
             params={
                 # Curriculum widens this over training; see kick_envelope below.
-                "distance_range": (1.0, 2.0),
+                "distance_range": (0.5, 1.0),
                 "bearing_range": (-math.pi, math.pi),
-                "speed_range": (0.0, 1.5),
+                "speed_range": (0.0, 0.0),
             },
         ),
         "foot_friction": EventTermCfg(
@@ -185,37 +199,96 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
     ##
 
     rewards = {
-        "kick_outcome": RewardTermCfg(
-            func=kick_mdp.kick_outcome,
-            weight=20.0,
+        "directional_approach": RewardTermCfg(
+            func=kick_mdp.directional_approach_progress,
+            weight=1.5,
+            params={
+                "command_name": "kick",
+                "staging_distance": 0.45,
+                "clearance_radius": 0.35,
+                "staging_threshold": 0.22,
+                "heading_threshold": math.radians(35.0),
+            },
+        ),
+        "facing_ball": RewardTermCfg(
+            func=kick_mdp.facing_ball,
+            weight=0.25,
+            params={"command_name": "kick", "std": math.radians(25.0)},
+        ),
+        "useful_contact": RewardTermCfg(
+            func=kick_mdp.useful_contact,
+            weight=1.0,
             params={"command_name": "kick"},
         ),
-        "closing_velocity": RewardTermCfg(
-            func=kick_mdp.closing_velocity,
+        "launch_quality": RewardTermCfg(
+            func=kick_mdp.launch_quality,
             weight=2.0,
+            params={"command_name": "kick"},
+        ),
+        "accepted_launch": RewardTermCfg(
+            func=kick_mdp.accepted_launch,
+            weight=7.0,
+            params={"command_name": "kick"},
+        ),
+        "stable_completion": RewardTermCfg(
+            func=kick_mdp.stable_completion,
+            weight=8.0,
+            params={"command_name": "kick"},
         ),
         "time_penalty": RewardTermCfg(
             func=kick_mdp.time_penalty,
-            weight=-0.05,
+            weight=-0.1,
+            params={"command_name": "kick"},
         ),
         "upright": RewardTermCfg(
-            func=variable_upright,
-            weight=1.0,
+            func=velocity_mdp.upright,
+            weight=0.5,
             params={
-                "command_name": "kick",
-                "std_standing": math.sqrt(0.20),
-                "std_walking": math.sqrt(0.30),
-                "std_running": math.sqrt(0.45),
-                "walking_threshold": 0.05,
-                "running_threshold": 1.5,
+                "std": math.sqrt(0.30),
                 "asset_cfg": SceneEntityCfg("robot", body_names=()),  # Set per-robot.
             },
         ),
-        "dof_pos_limits": RewardTermCfg(func=velocity_mdp.joint_pos_limits, weight=-1.0),
-        "action_rate_l2": RewardTermCfg(func=velocity_mdp.action_rate_l2, weight=-0.1),
+        "body_ang_vel": RewardTermCfg(
+            func=velocity_mdp.body_angular_velocity_penalty,
+            weight=-0.03,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=()),  # Set per robot.
+            },
+        ),
+        "upper_body_posture": RewardTermCfg(
+            func=velocity_mdp.posture,
+            weight=0.25,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=(r"Head_.*", r".*_Shoulder_.*", r".*_Elbow_.*"),
+                ),
+                "std": {
+                    r"Head_.*": 0.08,
+                    r".*_Shoulder_.*": 0.30,
+                    r".*_Elbow_.*": 0.35,
+                },
+            },
+        ),
+        "upper_body_joint_vel": RewardTermCfg(
+            func=velocity_mdp.joint_vel_l2,
+            weight=-0.01,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=(r"Head_.*", r".*_Shoulder_.*", r".*_Elbow_.*"),
+                )
+            },
+        ),
+        "failure": RewardTermCfg(func=kick_mdp.failure_event, weight=-10.0),
+        "dof_pos_limits": RewardTermCfg(
+            func=velocity_mdp.joint_pos_limits, weight=-0.5
+        ),
+        "action_rate_l2": RewardTermCfg(func=velocity_mdp.action_rate_l2, weight=-0.10),
+        "action_acc_l2": RewardTermCfg(func=velocity_mdp.action_acc_l2, weight=-0.02),
         "self_collisions": RewardTermCfg(
             func=velocity_mdp.self_collision_cost,
-            weight=-1.0,
+            weight=-0.5,
             params={"sensor_name": "self_collision"},
         ),
     }
@@ -227,8 +300,8 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
     terminations = {
         "time_out": TerminationTermCfg(func=velocity_mdp.time_out, time_out=True),
         "fell_over": TerminationTermCfg(
-            func=stochastic_bad_orientation,
-            params={"limit_angle": math.radians(63.0), "probability": 0.02},
+            func=velocity_mdp.bad_orientation,
+            params={"limit_angle": math.radians(50.0)},
         ),
         "illegal_contact": TerminationTermCfg(
             func=velocity_mdp.illegal_contact,
@@ -244,6 +317,9 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
                 "command_name": "kick",
                 "contact_sensor_name": "foot_ball_contact",
                 "measure_delay_steps": 3,
+                "recovery_steps": 50,
+                "recovery_max_tilt": math.radians(20.0),
+                "recovery_max_ang_vel": 1.5,
             },
         ),
     }
@@ -253,8 +329,7 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
     ##
 
     curriculum = {
-        # Widen the commanded speed/direction/chip envelope and spawn distance as
-        # competence improves, mirroring amp/curriculums.py's stage-annealing pattern.
+        # Advance only after forward, side and reverse stable-success bins pass.
         "kick_envelope": CurriculumTermCfg(
             func=kick_mdp.kick_envelope,
             params={
@@ -262,25 +337,60 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
                 "spawn_event_name": "spawn_ball",
                 "stages": [
                     {
-                        "step": 0,
                         "speed": (1.5, 2.5),
-                        "yaw": (-math.pi / 2, math.pi / 2),
+                        "yaw": (-math.pi, math.pi),
                         "chip_angle": (0.0, 0.0),
-                        "spawn_distance": (1.0, 2.0),
+                        "speed_tolerance_fraction": (0.30, 0.50),
+                        "direction_tolerance": (
+                            math.radians(30.0),
+                            math.radians(60.0),
+                        ),
+                        "spawn_distance": (0.5, 1.0),
+                        "ball_speed": (0.0, 0.0),
+                        "min_episodes_per_bin": 500,
+                        "promotion_success_rate": 0.80,
                     },
                     {
-                        "step": 3000 * 24,
                         "speed": (1.5, 3.0),
                         "yaw": (-math.pi, math.pi),
-                        "chip_angle": (0.0, math.radians(10.0)),
-                        "spawn_distance": (1.0, 3.0),
+                        "chip_angle": (0.0, 0.0),
+                        "speed_tolerance_fraction": (0.15, 0.50),
+                        "direction_tolerance": (
+                            math.radians(10.0),
+                            math.radians(60.0),
+                        ),
+                        "spawn_distance": (1.0, 2.0),
+                        "ball_speed": (0.0, 0.3),
+                        "min_episodes_per_bin": 500,
+                        "promotion_success_rate": 0.80,
                     },
                     {
-                        "step": 8000 * 24,
+                        "speed": (1.5, 4.0),
+                        "yaw": (-math.pi, math.pi),
+                        "chip_angle": (0.0, math.radians(10.0)),
+                        "speed_tolerance_fraction": (0.15, 0.50),
+                        "direction_tolerance": (
+                            math.radians(10.0),
+                            math.radians(60.0),
+                        ),
+                        "spawn_distance": (1.0, 3.0),
+                        "ball_speed": (0.0, 0.8),
+                        "min_episodes_per_bin": 500,
+                        "promotion_success_rate": 0.80,
+                    },
+                    {
                         "speed": (1.5, 4.0),
                         "yaw": (-math.pi, math.pi),
                         "chip_angle": (0.0, math.radians(20.0)),
+                        "speed_tolerance_fraction": (0.15, 0.50),
+                        "direction_tolerance": (
+                            math.radians(10.0),
+                            math.radians(60.0),
+                        ),
                         "spawn_distance": (1.5, 4.0),
+                        "ball_speed": (0.0, 1.5),
+                        "min_episodes_per_bin": 500,
+                        "promotion_success_rate": 0.80,
                     },
                 ],
             },
@@ -315,8 +425,9 @@ def make_kick_env_cfg() -> ManagerBasedRlEnvCfg:
                 timestep=0.005,
                 iterations=10,
                 ls_iterations=20,
+                cone="elliptic",
             ),
         ),
         decimation=4,
-        episode_length_s=6.0,
+        episode_length_s=10.0,
     )

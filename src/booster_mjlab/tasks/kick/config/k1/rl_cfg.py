@@ -23,7 +23,12 @@ def booster_k1_kick_ppo_runner_cfg(use_muon: bool = False) -> RslRlOnPolicyRunne
             obs_normalization=True,
             distribution_cfg={
                 "class_name": "rsl_rl.modules.distribution:GaussianDistribution",
-                "init_std": 1.0,
+                # The unbounded scalar Gaussian reached a mean std of 4.01
+                # (individual joints 5.42) in the first full kick run. Bound
+                # exploration while leaving the mean action free for a strike.
+                "init_std": 0.45,
+                "std_type": "log",
+                "std_range": (0.05, 0.75),
             },
         ),
         critic=RslRlModelCfg(
@@ -35,7 +40,7 @@ def booster_k1_kick_ppo_runner_cfg(use_muon: bool = False) -> RslRlOnPolicyRunne
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.01,
+            entropy_coef=0.002,
             num_learning_epochs=5,
             num_mini_batches=4,
             learning_rate=1.0e-3,

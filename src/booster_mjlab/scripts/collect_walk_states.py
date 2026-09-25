@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -46,7 +47,9 @@ def _parse_args() -> argparse.Namespace:
         help="Checkpoint name within the W&B run (e.g. 'model_4000.pt'); latest if omitted.",
     )
     parser.add_argument(
-        "--checkpoint-file", default=None, help="Local checkpoint path (alternative to W&B)."
+        "--checkpoint-file",
+        default=None,
+        help="Local checkpoint path (alternative to W&B).",
     )
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument("--device", default=None)
@@ -56,6 +59,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--collect-min-interval", type=float, default=0.5)
     parser.add_argument("--collect-max-interval", type=float, default=2.0)
     parser.add_argument("--collect-asset-name", default="robot")
+    parser.add_argument("--min-root-height", type=float, default=0.35)
+    parser.add_argument("--max-tilt-deg", type=float, default=45.0)
     parser.add_argument(
         "--collect-progress-every",
         type=float,
@@ -89,7 +94,9 @@ def main() -> None:
     import mjlab.tasks  # noqa: F401
 
     if args.task_id not in list_tasks():
-        raise SystemExit(f"Unknown task '{args.task_id}'. Run list_envs to see options.")
+        raise SystemExit(
+            f"Unknown task '{args.task_id}'. Run list_envs to see options."
+        )
 
     configure_torch_backends()
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -150,13 +157,32 @@ def main() -> None:
         while sum(r.shape[0] for r in rows) < args.collect_num_states:
             obs = env.get_observations()
             actions = policy(obs)
-            env.step(actions)
+            _, _, dones, _ = env.step(actions)
             step_count += 1
 
             due = step_count >= next_snapshot_step
-            env_ids = due.nonzero(as_tuple=False).squeeze(-1)
+            terminal_ids = (due & dones.bool()).nonzero(as_tuple=False).squeeze(-1)
+            if terminal_ids.numel() > 0:
+                next_snapshot_step[terminal_ids] = step_count[
+                    terminal_ids
+                ] + sample_intervals(terminal_ids.numel())
+            candidate_ids = (due & ~dones.bool()).nonzero(as_tuple=False).squeeze(-1)
+            data = asset.data
+            candidate_root = _read_root_state_w(data)[candidate_ids]
+            quat = candidate_root[:, 3:7]
+            x = quat[:, 1]
+            y = quat[:, 2]
+            tilt = torch.acos((1.0 - 2.0 * (x * x + y * y)).clamp(-1.0, 1.0))
+            stable = (
+                (candidate_root[:, 2] >= args.min_root_height)
+                & (
+                    tilt
+                    <= torch.deg2rad(torch.tensor(args.max_tilt_deg, device=device))
+                )
+                & torch.isfinite(candidate_root).all(dim=-1)
+            )
+            env_ids = candidate_ids[stable]
             if env_ids.numel() > 0:
-                data = asset.data
                 root_state = _read_root_state_w(data)[env_ids]
                 joint_pos = data.joint_pos[env_ids]
                 joint_vel = data.joint_vel[env_ids]
@@ -177,9 +203,15 @@ def main() -> None:
                     dim=-1,
                 )
                 rows.append(row.detach().cpu())
-                next_snapshot_step[env_ids] = (
-                    step_count[env_ids] + sample_intervals(env_ids.numel())
+                next_snapshot_step[env_ids] = step_count[env_ids] + sample_intervals(
+                    env_ids.numel()
                 )
+            # Resample rejected candidates rather than checking every step.
+            rejected_ids = candidate_ids[~stable]
+            if rejected_ids.numel() > 0:
+                next_snapshot_step[rejected_ids] = step_count[
+                    rejected_ids
+                ] + sample_intervals(rejected_ids.numel())
 
             now = time.perf_counter()
             if now - last_print >= args.collect_progress_every:
@@ -203,6 +235,15 @@ def main() -> None:
                 "root_lin_vel(3), root_ang_vel(3), joint_vel(nj)"
             ),
             "asset_name": args.collect_asset_name,
+            "joint_names": tuple(asset.joint_names),
+            "source_task": args.task_id,
+            "source_checkpoint": str(resume_path.resolve()),
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "filters": {
+                "min_root_height": args.min_root_height,
+                "max_tilt_deg": args.max_tilt_deg,
+                "exclude_terminal_steps": True,
+            },
         },
         args.collect_out,
     )

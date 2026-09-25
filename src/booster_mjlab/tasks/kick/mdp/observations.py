@@ -1,4 +1,4 @@
-"""Kick task observation terms."""
+"""Ground-truth and explicitly stateful ball observations."""
 
 from __future__ import annotations
 
@@ -21,14 +21,9 @@ def ball_state_relative_b(
     robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
     ball_cfg: SceneEntityCfg = _DEFAULT_BALL_CFG,
 ) -> torch.Tensor:
-    """Ground-truth ball position/velocity relative to the robot, in its body frame.
-
-    Shape (num_envs, 6): ``[rel_pos(3), rel_vel(3)]``. Used directly for the critic;
-    the actor instead sees ``noisy_ball_state_relative_b`` below.
-    """
+    """Relative ball position/velocity in the robot's full body frame."""
     robot = env.scene[robot_cfg.name]
     ball = env.scene[ball_cfg.name]
-
     rel_pos_w = ball.data.root_link_pos_w - robot.data.root_link_pos_w
     rel_vel_w = ball.data.root_link_lin_vel_w - robot.data.root_link_lin_vel_w
     rel_pos_b = quat_apply_inverse(robot.data.root_link_quat_w, rel_pos_w)
@@ -36,48 +31,102 @@ def ball_state_relative_b(
     return torch.cat([rel_pos_b, rel_vel_b], dim=-1)
 
 
-def noisy_ball_state_relative_b(
+def clean_ball_state_relative_b(
     env: ManagerBasedRlEnv,
     robot_cfg: SceneEntityCfg = _DEFAULT_ROBOT_CFG,
     ball_cfg: SceneEntityCfg = _DEFAULT_BALL_CFG,
-    pos_noise_std: float = 0.07,
-    vel_noise_std: float = 0.4,
-    latency_steps: int = 2,
-    dropout_prob: float = 0.05,
 ) -> torch.Tensor:
-    """Vision-corrupted ball state relative to the robot, in its body frame.
+    """Eight-value clean observation with age=0 and valid=1."""
+    state = ball_state_relative_b(env, robot_cfg, ball_cfg)
+    status = torch.zeros(env.num_envs, 2, device=env.device)
+    status[:, 1] = 1.0
+    return torch.cat([state, status], dim=-1)
 
-    Placeholder noise model (per user decision, tune once real vision stats are
-    available): Gaussian position/velocity noise, a fixed-length latency buffer, and
-    a dropout probability that holds the last delayed estimate instead of the fresh
-    one (models a stale/missed vision update rather than a spike to zero).
 
-    Shape (num_envs, 6): ``[rel_pos(3), rel_vel(3)]``.
+class noisy_ball_state_relative_b:
+    """Reset-aware vision model with noise, fixed latency, dropout, age and validity.
+
+    Output is ``[rel_pos(3), rel_vel(3), age_seconds, measurement_valid]``.
+    The term advances at most once per environment control step even if an
+    observation is queried multiple times by tooling.
     """
-    ground_truth = ball_state_relative_b(env, robot_cfg, ball_cfg)
-    noise = torch.zeros_like(ground_truth)
-    noise[:, 0:3] = torch.randn_like(ground_truth[:, 0:3]) * pos_noise_std
-    noise[:, 3:6] = torch.randn_like(ground_truth[:, 3:6]) * vel_noise_std
-    sample = ground_truth + noise
 
-    just_reset = env.episode_length_buf == 0
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        params = cfg.params
+        self.robot_cfg = params.get("robot_cfg", _DEFAULT_ROBOT_CFG)
+        self.ball_cfg = params.get("ball_cfg", _DEFAULT_BALL_CFG)
+        self.pos_noise_std = params.get("pos_noise_std", 0.07)
+        self.vel_noise_std = params.get("vel_noise_std", 0.4)
+        self.latency_steps = params.get("latency_steps", 2)
+        self.dropout_prob = params.get("dropout_prob", 0.05)
+        self.enable_noise = params.get("enable_noise", True)
+        if self.latency_steps < 0:
+            raise ValueError("latency_steps must be non-negative")
 
-    buf_key = "_kick_ball_obs_buffer"
-    if not hasattr(env, buf_key):
-        setattr(env, buf_key, sample.unsqueeze(1).repeat(1, latency_steps + 1, 1))
-    buf = getattr(env, buf_key)
-    buf = torch.where(just_reset.view(-1, 1, 1), sample.unsqueeze(1), buf)
-    buf = torch.cat([buf[:, 1:], sample.unsqueeze(1)], dim=1)
-    setattr(env, buf_key, buf)
-    delayed = buf[:, 0]
+        self.buffer = torch.zeros(
+            env.num_envs, self.latency_steps + 1, 6, device=env.device
+        )
+        self.output = torch.zeros(env.num_envs, 8, device=env.device)
+        self.initialized = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+        self.last_update_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+        self.history_age_steps = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
 
-    hold_key = "_kick_ball_obs_hold"
-    if not hasattr(env, hold_key):
-        setattr(env, hold_key, delayed.clone())
-    held = getattr(env, hold_key)
-    held = torch.where(just_reset.view(-1, 1), delayed, held)
+    def reset(self, env_ids: torch.Tensor | slice | None) -> None:
+        self.initialized[env_ids] = False
+        self.buffer[env_ids] = 0.0
+        self.output[env_ids] = 0.0
+        self.last_update_step[env_ids] = -1
+        self.history_age_steps[env_ids] = 0
 
-    dropout = torch.rand(env.num_envs, device=env.device) < dropout_prob
-    output = torch.where(dropout.view(-1, 1), held, delayed)
-    setattr(env, hold_key, output)
-    return output
+    def __call__(self, env: ManagerBasedRlEnv, **_params) -> torch.Tensor:
+        truth = ball_state_relative_b(env, self.robot_cfg, self.ball_cfg)
+        if not self.enable_noise:
+            status = torch.zeros(env.num_envs, 2, device=env.device)
+            status[:, 1] = 1.0
+            return torch.cat([truth, status], dim=-1)
+
+        current_step = int(env.common_step_counter)
+        update_ids = (
+            (self.last_update_step != current_step).nonzero(as_tuple=False).squeeze(-1)
+        )
+        if update_ids.numel() == 0:
+            return self.output
+
+        sample = truth[update_ids].clone()
+        sample[:, :3] += torch.randn_like(sample[:, :3]) * self.pos_noise_std
+        sample[:, 3:] += torch.randn_like(sample[:, 3:]) * self.vel_noise_std
+        fresh_mask = ~self.initialized[update_ids]
+        fresh_ids = update_ids[fresh_mask]
+        if fresh_ids.numel() > 0:
+            fresh_sample = sample[fresh_mask]
+            self.buffer[fresh_ids] = fresh_sample[:, None, :]
+            self.output[fresh_ids, :6] = fresh_sample
+            self.output[fresh_ids, 6] = self.latency_steps * env.step_dt
+            self.output[fresh_ids, 7] = 1.0
+            self.initialized[fresh_ids] = True
+
+        continuing_ids = update_ids[~fresh_mask]
+        self.history_age_steps[continuing_ids] = (
+            self.history_age_steps[continuing_ids] + 1
+        ).clamp_max(self.latency_steps)
+
+        self.buffer[update_ids, :-1] = self.buffer[update_ids, 1:].clone()
+        self.buffer[update_ids, -1] = sample
+        delayed = self.buffer[update_ids, 0]
+        dropout = torch.rand(update_ids.numel(), device=env.device) < self.dropout_prob
+        self.output[update_ids, :6] = torch.where(
+            dropout[:, None], self.output[update_ids, :6], delayed
+        )
+        base_age = self.history_age_steps[update_ids] * env.step_dt
+        self.output[update_ids, 6] = torch.where(
+            dropout, self.output[update_ids, 6] + env.step_dt, base_age
+        )
+        self.output[update_ids, 7] = (~dropout).float()
+        self.last_update_step[update_ids] = current_step
+        return self.output

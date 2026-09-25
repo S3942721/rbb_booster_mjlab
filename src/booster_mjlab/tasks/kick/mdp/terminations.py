@@ -20,17 +20,37 @@ def kick_complete(
     contact_sensor_name: str,
     ball_asset_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
     measure_delay_steps: int = 3,
+    recovery_steps: int = 20,
+    recovery_max_tilt: float = 0.35,
+    recovery_max_ang_vel: float = 1.5,
+    robot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    foot_body_names: tuple[str, str] = ("left_foot_link", "right_foot_link"),
+    min_forward_contact: float | None = None,
+    invalid_termination_names: tuple[str, ...] = (
+        "fell_over",
+        "illegal_contact",
+        "mis_kick",
+    ),
 ) -> torch.Tensor:
-    """Ends the episode the step the kick outcome is measured (single kick/episode).
+    """End after a measured failed attempt or recovered accepted launch.
 
     Runs before rewards each step (mjlab computes terminations first), so this term
     owns advancing the contact->measurement countdown and calling
-    ``KickCommand.register_kick()``; ``mdp/rewards.py``'s ``kick_outcome`` reward
-    only reads the result this same step.
+    ``KickCommand.register_kick()``; event rewards only read the result this same
+    step. Accepted launches remain active through a recovery window before this
+    term reports completion.
     """
-    resolving_ids = advance_kick_progress(
-        env, contact_sensor_name, command_name, ball_asset_cfg, measure_delay_steps
+    return advance_kick_progress(
+        env,
+        contact_sensor_name,
+        command_name,
+        ball_asset_cfg,
+        measure_delay_steps,
+        recovery_steps,
+        invalid_termination_names,
+        recovery_max_tilt,
+        recovery_max_ang_vel,
+        robot_asset_cfg,
+        foot_body_names,
+        min_forward_contact,
     )
-    done = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    done[resolving_ids] = True
-    return done
